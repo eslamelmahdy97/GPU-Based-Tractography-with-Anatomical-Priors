@@ -1,0 +1,121 @@
+#!/usr/bin/python3
+# -*- coding: utf-8 -*-
+
+
+import argparse
+from weakref import ref
+import nrrd
+import nibabel as nib
+import numpy as np
+from tracking2 import  DirectionSelectorTOMRegularized,DirectionSelectorProbabilistic, RegularizedInterpolator, Tracking, Validator, DirectionGetterLowRank, DirectionGetterLowRankReg, DirectionSelectorNext, DirectionSelectorRegularized, StoppingTractSegValidator, DirectionValidator, dirSelector, Trafo, Interpolator,TOMDirectionGetter
+import torch as T
+import cupy as cp
+
+def create_affine_nrrd(meta):
+    affine = T.zeros((4, 4))   
+    affine[:3, :3] = T.tensor(meta['space directions'][-3:, -3:].T)
+    affine[:3, 3] = T.tensor(meta['space origin'])
+    affine[3, 3] = 1
+    return affine
+
+def load_nrrd(filename):
+    data, meta = nrrd.read(filename)
+    data = np.rollaxis(data, 0, 4)
+    data = data[...,1:] 
+    affine = create_affine_nrrd(meta)
+    affine = Trafo(affine)
+    return Interpolator(data, affine)
+
+def load_nrrd_normal(filename):
+    data, meta = nrrd.read(filename)
+    affine = create_affine_nrrd(meta)
+    affine = Trafo(affine)
+    return Interpolator(data, affine)
+
+
+def load_nibabel(filename):
+    if not filename:
+        return None
+    img = nib.load(filename)
+    return Interpolator(img.get_fdata(), Trafo(img.affine))
+
+def load_wm(filename):
+    if filename.endswith('.nii.gz'):
+        return load_nibabel(filename)
+    elif filename.endswith('.nrrd'):
+        return load_nrrd_normal(filename)
+    else:
+        print("Unknown file format")
+    
+def load_nibabel_ref(filename):
+    if not filename:
+        return None
+    img = nib.load(filename)
+    data = img.get_fdata()
+    data = cp.array(np.divide(data, np.linalg.norm(data, axis=-1)[..., None], where=np.linalg.norm(data, axis=-1)[...,None]!=0))
+    return Interpolator(data, Trafo(img.affine))
+
+def load_numpy(filename):
+    return np.loadtxt(filename)
+
+def load_seedfile(filename):
+    if filename.endswith('.pts'):
+        return np.loadtxt(filename)
+    elif filename.endswith('.nrrd'):
+        data, meta = nrrd.read(filename)
+        data = np.array(np.where(data > 0.5))
+        data = np.vstack([data, np.ones([1, data.shape[1]])]).T
+        affine = create_affine_nrrd(meta)
+        data = np.dot(affine, data.T).T
+        return data
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--fodf_field', type=load_nrrd, required=True, help='FODF field file (NRRD format)')
+    parser.add_argument('--reference_direction_field', type=load_nibabel_ref, required=False, help='Reference direction field file (NIfTI format)')
+    parser.add_argument('--wmregion', type=load_wm, required=True, help='fast pve2 mask')
+    parser.add_argument('--seedfile', type=load_seedfile, required=True, help='Seed file (NumPy text format) or (NRRD format)')
+    parser.add_argument('--end_region_files', type=load_nibabel, nargs='+', help='End region files (NIfTI format)')
+    parser.add_argument('--tom', type=load_nibabel, required=False, help='TOM File (NIfTI format)')
+    parser.add_argument('--model', required=True, help='Weights of the model pth file') # Hier noch defaults einsetzen 
+    parser.add_argument('--regularized_model', required=False, help='Regularized model pth file')
+    parser.add_argument('--samples', help='Samples', type=int)
+    parser.add_argument('-o', required=True, help='output path')
+    args = parser.parse_args()
+
+    # Now you can access the loaded data like this:
+    fodfs = args.fodf_field
+    refDirs = args.reference_direction_field
+    tom=args.tom
+    seeds = args.seedfile
+    ## If samples are given, draw samples from the seeds otherwise use all seeds
+    if args.samples:
+        draws = np.random.choice(seeds.shape[0], args.samples)
+        seeds = seeds[draws]
+        seeds += np.random.normal(size=seeds.shape)
+    endRegions = args.end_region_files
+    
+    if args.regularized_model and refDirs:
+        print('Using regularized model')
+        dirGetter = DirectionGetterLowRankReg(args.regularized_model, refDirs, args.model, fodfs)
+        dirSelector = DirectionSelectorRegularized(refDirs, 0.1)
+    if args.tom:
+        print("Using Using custom TOM-based model")
+        dirGetter= TOMDirectionGetter(args.model, fodfs, tom)
+        dirSelector = DirectionSelectorProbabilistic(0.1)
+    else:
+        print('Using non-regularized model')
+        dirGetter = DirectionGetterLowRank(args.model, fodfs)
+        dirSelector = DirectionSelectorProbabilistic(0.1)
+    trackingStopper = Validator(seeds, args.wmregion, **dict(fodfs=fodfs, DirValidator=True, TractSegValidator=True, 
+                                            StoppingRegions=endRegions))
+    tracker = Tracking(dirGetter, dirSelector, trackingStopper, seeds, args.o)
+    tracker.create_tractogram()
+    tracker.save()
+    
+    
+    
+
+
+if __name__=="__main__":
+    main()
